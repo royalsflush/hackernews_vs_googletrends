@@ -46,6 +46,7 @@
 %%
 \documentclass[nonacm,sigconf]{acmart}
 \usepackage{tabularx}
+\usepackage{listings}
 
 %%
 %% \BibTeX command to typeset BibTeX logo in the docs
@@ -174,7 +175,7 @@ We build on the existing work by comparing the dataset from a specialised commun
 \section{Proposed work}
 \begin{figure}
     \centering
-    \includegraphics[width=0.9\linewidth]{Data_pipeline_overview.png}
+    \includegraphics[width=0.9\linewidth]{Data pipeline checkpoint.png}
     \caption{End-to-end flow for the data processing needed to be able to compare Hacker News and Google trend topic popularity}
     \label{fig:pipeline_overview}
     \Description{Dataflow is: fetch data from Hacker News, prepare and preprocess it, then cluster into topics and calculate the populate. For each topic, generate most relevant keywords and fetch interest from Google trends. Finally, compare the two distributions}
@@ -213,20 +214,24 @@ The steps for data preparation are as follows:
 
 \begin{itemize}
     \item Remove invalid / uninteresting rows
-    \item Fetch articles
+    \item Resolve story-comment relationship
     \item Assemble the full document
-    \item Compute the popularity score
+    \item Compute the popularity for an individual story
 \end{itemize}
 
-\paragraph{Remove invalid / uninteresting rows} The dataset has a lot of rows that contain NULLs, dead stories, job postings, polls and pollopt (i.e. poll options), and comments that reference any of those. We're not interested in any rows outside of stories and comments. We want to leave the table with only valid stories and comments that can be traced back to stories.
-\paragraph{Fetch articles} In Hacker News, a story can have three elements: a title, a URL and a free-form text. We want to fetch the URL text for each of the stories, if the URL parameter isn't NULL, so we can properly examine the contents of the post, which will give more information to then extract the topic. If an article is not available, we remove the story from the dataset.
-\paragraph{Assemble the full document} We want to have, for each story, its full article extracted from the webpage, the title, the free form text, and a concatenation of the text of all the comments. In terms of scoring, we should have three rows related to it: the original story score, the descendants score, which should be equal to the count of comments, and an array with the votes for each comment
-\paragraph{Compute the popularity score} For each story, we want to aggregate the popularity score as follows:
-\begin{equation} \label{eq:pop_score}
-  score_{story} + count_{comment} + \sum_{i=0}^{count_{comment}} score_{comment}
-\end{equation}
+The original dataset was in BigQuery, so we decided to leverage BigQuery itself to all computations we possibly could, given its superior parallelism to what can be obtained in a single-worker (even if multiprocessing / multithreading) colab notebook. BigQuery was also used for all of the data warehousing of the project.
 
-This is not a perfect measure of engagement. We acknowledge that, because of the score of a story / comment being upvotes minus downvotes, it will be a floor to how many votes it got.
+\paragraph{Remove invalid / uninteresting rows} The dataset has a lot of rows that contain NULLs, dead stories, job postings, polls and pollopt (i.e. poll options), and comments that reference any of those. We're not interested in any rows outside of stories and comments. We want to leave the table with only valid stories and comments that can be traced back to stories. We created two views for the data initially, \texttt{hackernews\_story} and \texttt{hackernews\_comment} as further understood the data and what fields were relevant for each of the entities.
+\paragraph{Resolve story-comment relationship} Upon further inspection of the dataset, we noticed comments could have a tree structure, as opposed to linking directly to the story (and the story was the root of the tree). We need to do a tree traversal to link stories and comments.
+\paragraph{Assemble the full document} We want to have, for each story, the id, title, the free form text, and a concatenation of the text of all the comments. We included timestamps for each of the comments and also the story publication. Finally, we want the story score to be able to calculate the overall score.
+\paragraph{Compute the popularity for an individual story} We're defining the population of a story by the sum of votes it gets and the count of comments. It's worth noting, though, that comments can happen way later in time, and because we have a timestamp for them, we can add the comment to the correct bucket. For instance, let's suppose that a story was published March 30th, it received 50 votes overall, then received two comments that day, then 2 more on April 2nd. Here's how the popularity distribution for that story would look like:
+
+\begin{verbatim}
+    (0001 // story id, 2026-03-30, 52)
+    (0001 // story id, 2026-04-02, 2)
+\end{verbatim}
+
+This is not a perfect measure of engagement. We acknowledge that, because of the score of a story / comment being upvotes minus downvotes, it will be a floor to how many votes it got. Another simplification on the temporal aspect of popularity was that it's likely that points are more distributed that the initial publication of the story. However, because Google trends data is bucketed by month when you request all-time data, the granularity of the bucket makes this problem way less apparent than it would have been for a day-bucketed distribution. For the full dataset, 4.6 million stories are contained to a month, 74,000 live two months, and less than 200 live more than that.
 
 At the end we should have transformed the data into Table \ref{tab:cleaned}. Because we might end up with a significant amount of text (the data set has about 5 million story, and about 42 million comments, and the free form text fields are of arbitrary length), we want to save those to a data warehouse to prevent recomputation once we're happy with the new schema and then stream them to the next step of the algorithm.
 
@@ -237,15 +242,24 @@ At the end we should have transformed the data into Table \ref{tab:cleaned}. Bec
     Column name&Description\\
     \hline
     story\_id & Original story ID. \\
-    story\_link & A url in the format https://news.ycombinator.com/item?id=<id> \\
-    payload & The concatenation of the story title, article text, free form text and all the comments, each separated by a new line if not NULL \\
-    popularity\_score & The popularity score as described in Equation \ref{eq:pop_score}
+    story\_link & A url in the format https://news.ycombinator.com/item?id=<id>. \\
+    story\_score & The original story score. 0 if NULL. \\
+    story\_timestamp & Timestamp for the story's initial publication. \\
+    story\_title & Unmodified title. \\
+    story\_text & Unmodified story text. "" if NULL. \\
+    comments\_text & Concatenation of the texts of all comments. "" if the comment has NULL value. "" if the story has no comments. \\
+    comments\_ids & Array with all comment ids that are linked to this story. \\
+    comments\_timestamps & Array with all timestamps from comments linked to this story. \\
 \end{tabular}
 \end{table*}
 
-\subsection{Topic extraction and popularity}
+\subsection{Pre-processing and clustering}
 
-According to the review of the literature, there are many routes that can be taken. The most commonly used algorithm for this analysis would LDA, which is implemented in popular libraries like the aforementioned SKLearn and Gensim. BERTopic is also made available on GitHub\footnote{https://maartengr.github.io/BERTopic/index.html} to be used in a Jupyter notebook. As a starting point, we'll use the clustering tutorial from Dimensions.ai\footnote{https://www.dimensions.ai/products/all-products/dimensions-on-google-bigquery/}, which leverages native BigQuery functionalities to cluster the data\footnote{https://bigquery-lab.dimensions.ai/tutorials/05-topic\_clusters/}. k-means is likely to underperform other algorithms, as the related work section pointed out. However, due to timeline constraints, our focus is to have a functioning end-to-end pipeline.
+According to the review of the literature, there are many routes that can be taken. The most commonly used algorithm for this analysis would LDA, which is implemented in popular libraries like the aforementioned SKLearn and Gensim. BERTopic is also made available on GitHub\footnote{https://maartengr.github.io/BERTopic/index.html} to be used in a Jupyter notebook. As a starting point, we'll use the clustering tutorial from Dimensions.ai\footnote{https://www.dimensions.ai/products/all-products/dimensions-on-google-bigquery/}, which leverages native BigQuery functionalities to cluster the data\footnote{https://bigquery-lab.dimensions.ai/tutorials/05-topic\_clusters/}. The tutorial uses the Universal Sentence Encoder\footnote{https://www.kaggle.com/models/google/universal-sentence-encoder}, first presented in Cer et al \cite{DBLP:journals/corr/abs-1803-11175}, which compares positively with other embedding methods due to pre-training.
+
+For the clustering algorithm, we used k-means. We're aware that k-means is likely to underperform other algorithms, as the related work section pointed out. However, due to timeline constraints and its availability in BigQuery ML as a potential model \footnote{https://docs.cloud.google.com/bigquery/docs/reference/standard-sql/bigqueryml-syntax-create-kmeans}, it is our model of choice. To attempt to mitigate not leaning into the state of the art for clustering, we'll calibrate its number of clusters with several trials with different parameters \footnote{https://docs.cloud.google.com/bigquery/docs/reference/standard-sql/bigqueryml-syntax-create-kmeans\#hyperparameter\_tuning}
+
+\subsection{Topic extraction and popularity}
 
 Once we have the topics extracted, it is trivial to perform a scan of the dataset and obtain the popularity per topic, it's the sum of the popularity of all the articles in the cluster for a timestamp. That will give us a distribution of popularity per topic over time. To be able to compare with search trends data, the final step is to normalise all the distributions.
 
@@ -259,9 +273,51 @@ After sorting, we can pick up two adjacent distributions (A, B) and (B, C), wher
 
 \paragraph{Distribution plotting per topic} Given distributions are all two-dimensional, and we're using k-means, which allows us to set the number of topics we're looking at, we can perform a visual analysis of both distributions.
 
-\paragraph{Clustering quality metrics} To help choose a sensible k that we can still analyse with plotting the graphs for each topic, we want to tune k so it offers diminishing returns on intra and inter cluster distances.
+\paragraph{Clustering quality metrics} To help choose a sensible k that we can still analyse with plotting the graphs for each topic, we want to tune k so it offers diminishing returns on intra and inter cluster distances. We opted to use the Davies-Bouldin index\footnote{https://en.wikipedia.org/wiki/Davies-Bouldin\_index}, which captures a relationship between exactly those metrics.
 
-\paragraph{Clustering efficiency} The clustering processing is the heaviest part of the processing for the project, so as a secondary metric, we want to measure the time it takes to perform the clustering operation.
+We ran our clustering algorithm for 9 trials with different numbers of clusters (k), using the Davies-Bouldin index to contrast performance. The results are in Table \ref{tab:kmeansbest}, which is sorted from lowest to highest index, and clearly demonstrates that k=3 achieves the best performance.
+
+\begin{table}[h]
+  \caption{k-means trial results}
+  \label{tab:kmeansbest}
+  \begin{tabular}{|c|c|c|}
+    \hline
+    ID & Number of clusters&Davies-Bouldin index\\
+    \hline
+    4 & 3.0000 & 2.1001 \\
+    5 & 2.0000 & 2.5246 \\
+    3 & 5.0000 & 4.4259	\\
+    1 & 6.0000 & 4.6467 \\
+    8 & 8.0000 & 4.7129 \\
+    2 & 7.0000 & 4.7764	\\
+    6 & 10.0000	& 5.4605 \\
+    7 & 9.0000 & 5.4866	\\
+    9 & 4.0000 & 5.5879 \\
+    \hline
+\end{tabular}
+\end{table}
+
+\paragraph{Clustering efficiency} The clustering processing is the heaviest part of the processing for the project, so as a secondary metric, we want to measure the time it takes to perform the clustering operation. Contrary to my expectations, training, even with trials, was a relatively quick process, ranging from 60 to 112 seconds (see Table \ref{tab:kmeanstime}).
+
+\begin{table}[h]
+  \caption{k-means trial results}
+  \label{tab:kmeanstime}
+  \begin{tabular}{|c|c|}
+    \hline
+    ID&Time (seconds)\\
+    \hline
+    1 & 103.00	\\
+    2 & 104.00	\\
+    3 & 109.00	\\
+    4 & 81.00	\\
+    5 & 69.00	\\
+    6 & 96.00	\\
+    7 & 85.00	\\
+    8 & 112.00	\\
+    9 & 60.00 \\
+    \hline
+\end{tabular}
+\end{table}
 
 \section{Discussion}
 
@@ -281,14 +337,88 @@ Finally, interpretation of the results and accounting for any patterns or lack t
     \item Aug, 10, 2026, Project ideation: Come up with concepts for a potential project for Data Mining Project.
     \item Aug 12, 2026, Literature review: Read and summarise relevant papers in the area.
     \item Aug 14, 2026, Pipeline design: Study through the datasets and relevant APIs to design the pipeline.
-    \item Aug 15, 2026, Proposal first draft (current state): Write the proposal and slides for first submission.
-    \item Aug 16, 2026, First experimental results: Run through the experimental setup to get initial findings and challenges.
+    \item Aug 15, 2026, Proposal first draft: Write the proposal and slides for first submission.
+    \item Aug 16, 2026, First experimental results (current state): Run through the experimental setup to get initial findings and challenges.
     \item Aug 18, 2026, Project submission: Incorporate the feedback and tweak the findings. Write final evaluation and submit final version.
+\end{itemize}
+
+\subsection{Tree structure resolution in BigQuery}
+
+Upon further inspection of the dataset, we realised that comments don't directly point to a story. Comment \#41241122\footnote{https://news.ycombinator.com/item?id=41241122} is a nested comment in story \#41222577 \footnote{https://news.ycombinator.com/item?id=41222577}. If you click "parent" in its interface, or inspect the data for its parent, it doesn't link to the story. It links instead to the comment that immediately parents it, which is comment \#41240935 \footnote{https://news.ycombinator.com/item?id=41240935}. This required special pre-processing, since we wanted all the comments linking to their respective stories. We solved the issue by implementing a recursive table function in BigQuery:
+
+\begin{verbatim}
+CREATE OR REPLACE TABLE comment_story_mapping AS (
+  WITH RECURSIVE
+  comment_id_pairs AS (
+    SELECT id, parent
+    FROM `comment`
+  ),
+  story_ids AS (
+    SELECT id
+    FROM `story`
+  ),
+  R AS (
+    (SELECT id, parent AS ancestor from comment_id_pairs)
+    UNION ALL (
+      SELECT R.id, comment_ids.parent AS ancestor
+      FROM R
+      INNER JOIN comment_ids ON ancestor = comment_ids.id
+    )
+  )
+  SELECT R.id, ancestor
+  FROM R
+  INNER JOIN story_ids
+  ON story_ids.id = R.ancestor
+);
+\end{verbatim}
+
+\subsection{Addition of sampling step for the data.}
+
+To speed up iteration, and later to overcome performance issues with URL-fetching and embedding calculations, we have implemented sampling for the dataset. We currently sample \texttt{1\%} of the full 4 million 17GB (without URL contents) Hacker News archive. That amounts to about 4.600 rows and 16.3MB of text. Sampling was done by picking up 1\% of story\_ids at random, putting them into a table, and filtering by those items for all subsequent queries. 
+
+\subsection{Removal of the URL fetching due to performance concerns}
+
+We were initially going to fetch URL contents and use it as extra features for our clustering / topic extraction processes. There were two challenges with URL fetching that made us decide against using URLs for the time being: long waiting times for crawling each of the 4 million rows, and long time to encode into embeddings. For retrieval, we have benchmarked with 100 threads: 
+
+\begin{verbatim}
+    100%|| 10000/10000 [16:08<00:00, 10.32it/s]
+    URL fetching time: 980.6365852355957
+\end{verbatim}
+
+Which is about 16 minutes.  With the sampling size used, which is about 4GB of data and 4,700 stories, this would be perfectly feasible. However, embedding calculation on the URL contents didn't complete for at least an hour. The retrieved amount of data is an extra 2.8GB, and it added a significant amount of computation to the rest of 16MB that needed to be processed otherwise.
+
+\subsection{Embedding computation performance}
+
+We used each of the dimensions of title, text and comments as separate features. Due to the embedding having 512 dimensions for each vector, that resulted in 1536 features in total. The computation for embeddings was one of the bottlenecks for the pipeline (after the removal of URL encoding). Despite usage of parallelism, 10,000 rows still took a couple of minutes:
+
+\begin{verbatim}
+    [10000 rows x 4 columns]
+    Title embeddings processing time: 1.3596434593200684
+    Comment embeddings processing time: 138.32574224472046
+    Story text embeddings processing time: 37.59654760360718
+    URL content embeddings processing time: 37.73630213737488
+    Embeddings processing time: 215.02272725105286
+    BigQuery write time: 1.3290114402770996
+\end{verbatim}
+
+We have also tried to use BigQuery's native embeddings, which we believe would have benefited from the parallelism of the workflow \footnote{https://docs.cloud.google.com/bigquery/docs/generate-text-embedding}. We were unsucessful in our attempt, as it ran for 10 minutes for the same amount of rows without finishing. We have decided to stick with the original approach instead. 
+
+\section{Changes from proposal}
+
+\begin{itemize}
+    \item Addition of the tree structure resolution to get the story-comment relationship.
+    \item Addition of sampling step for the data.
+    \item Removal of the URL fetching due to performance concerns.
+    \item Significantly expanded the final data warehouse, added all the relevant metadata related to a story, as opposed to just the id, the popularity score and the payload.
+    \item Popularity is now bucketed per story and per month, which was an oversight of the initial proposal.
+    \item Usage of Davies-Bouldin index, as opposed to raw inter and intra cluster distances.
 \end{itemize}
 
 \section{Conclusion}
 
-Work is still in progress. 
+For this initial portion of the project involving data understanding, transformation and the first clustering, the biggest takeaway was around the importance of performance analysis, and the constant attention to using parallelism, preventing materialisation where it's not needed. The necessity of sampling at the beginning wasn't clear, and we believed that the biggest bottleneck would be the model training. We were surprised to find out that the embedding calculations would be so computationally expensive instead. We believe this is due to training using GPUs and high levels of optimisation, while the CPU-based workload to fetch URLs and convert their content into embeddings was an issue instead.
+
+Work is still in progress for the comparison between trends and the topic popularity distribution.
 
 \section{Future work}
 
@@ -298,6 +428,8 @@ There are broadly two types of avenues of future work following this experiment,
     \item Use more sophisticated sophisticated clustering algorithms to generate topics, such as LDA and BERTopic.
     \item Introduce semi-supervised methods by labelling a subset of the data to improve clustering possibilities.
     \item Use generally available data from social media instead of search to understand (e.g. Twitter) and contrast the three sets. It's possible that engagement on search is wildly different because active engagement and passive engagement with topics have different patterns, even within the same community.
+    \item Optimise the calculations for embeddings in order to use a bigger sample size
+    \item Introduce a more efficient large scale pipeline to crawl through the article URLs and transforms their content into embeddings so it isn't done locally, making it a bottleneck
 \end{itemize}
 
 %%
@@ -323,7 +455,6 @@ Assistance provided by Gemini for access to Google search data through APIs, Aug
 \end{itemize}
 
 Assistance provided by NotebookLM for feedback on first version of the proposal, Aug 17, 2026. Prompt was: "can you look at my draft proposal and give me feedback?". First draft link and full feedback can be found in \cite{projectnotes}
-
 \end{document}
 \endinput
 %%
